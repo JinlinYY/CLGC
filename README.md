@@ -1,8 +1,7 @@
 # A Multimodal Information-Interconnected Network for Medication Guidance in HR+/HER2- Breast Cancer Treatment
 
-![image](https://github.com/JinlinYY/MIINet/blob/main/Graph_Abstract.png)
 
-
+![image]https://github.com/JinlinYY/CLGC/blob/main/Abstract_graph.png)
 
 ## Data
 
