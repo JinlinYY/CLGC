@@ -12,6 +12,8 @@ The **NPS** dataset is open-access and can be found [https://www.kaggle.com/data
 The **TFF** dataset is open-access and can be found [https://www.isic-archive.com/](https://ieee-dataport.org/documents/three-phase-flow-facility).
 
 
- 
+🚀 Setup
 
-
+Tested with Python ≥ 3.9 and PyTorch ≥ 2.0.
+Depending on your environment, either PyTorch Geometric or DGL may be required—install the one your implementation uses.
+Typical Python dependencies:
