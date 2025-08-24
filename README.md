@@ -6,13 +6,6 @@
 Official implementation for “A Cross-modal Lag-aware Graph Contrastive Learning Framework for Safety-Domain Discrimination in Nuclear Power Systems”.
 The framework builds a lag-aware heterogeneous sensor graph over multi-rate operation (OP) and dose (DOSE) streams, performs temporal encoding + heterogeneous message passing, and optimizes multi-granularity contrastive objectives for robust, interpretable safety-domain inference.
 
----
-
-## ✨ Highlights
-
-- **Lag-aware graph construction**: directed, typed OP↔DOSE edges with normalized lag, interaction strength, polarity, and reliability attributes.
-- **Temporal–heterogeneous encoder**: lightweight Transformer at the node sequence level; GraphSAGE (intra-modal) + edge-aware GATv2 (cross-modal).
-- **Multi-granularity contrastive learning**: supervised contrast (fused), symmetric NT-Xent across modalities, and SimCLR-style augmentation (temporal masking + edge perturbation).
 
 ---
 
