@@ -1,4 +1,4 @@
-# A Multimodal Information-Interconnected Network for Medication Guidance in HR+/HER2- Breast Cancer Treatment
+# A Cross‑modal Lag-aware Graph Contrastive Learning Framework for Safety Domain Discrimination in Nuclear Power Systems
 
 ![image](https://github.com/JinlinYY/CLGC/blob/main/Abstract_graph.png)
 
