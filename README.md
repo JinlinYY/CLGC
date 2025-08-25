@@ -3,7 +3,7 @@
 
 ![image](https://github.com/JinlinYY/CLGC/blob/main/Abstract_graph.png)
 
-Official implementation for “A Cross-modal Lag-aware Graph Contrastive Learning Framework for Safety-Domain Discrimination in Nuclear Power Systems”.
+Official implementation for “A Cross-modal Lag-aware Graph Contrastive Learning Framework for Safety-Domain Modeling in Nuclear Power Systems”.
 The framework builds a lag-aware heterogeneous sensor graph over multi-rate operation (OP) and dose (DOSE) streams, performs temporal encoding + heterogeneous message passing, and optimizes multi-granularity contrastive objectives for robust, interpretable safety-domain inference.
 
 
