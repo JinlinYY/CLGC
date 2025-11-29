@@ -7,7 +7,7 @@
 - AUG   基于 z_fused 的轻量一致性（dropout 或加噪），受 --use_aug, --lmbd_aug 控制
 """
 
-import os, inspect, random
+import os, inspect, random, sys
 from typing import List, Optional, Tuple
 import numpy as np
 from collections import Counter
@@ -22,6 +22,12 @@ from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 from torch.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import StepLR, CosineAnnealingLR, ReduceLROnPlateau
+# ---- 解决直接运行时的导入路径 ----
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 # ---- 数据集与模型 ----
 import dataset.data_sampling_lag_edge_attr as ds
 from models.temporal_hetero_gnn_edge_attr_contrastive import TemporalPhysicalHeteroGNN_V2
@@ -70,19 +76,69 @@ class FocalLoss(nn.Module):
         return loss
 
 
-def supcon_loss(z: Optional[torch.Tensor], y: torch.Tensor, tau: float = 0.1) -> torch.Tensor:
+def supcon_loss(
+    z: Optional[torch.Tensor],
+    y: torch.Tensor,
+    tau: float = 0.1,
+    soft: bool = False,
+    label_tau: float = 0.5,
+) -> torch.Tensor:
+    """
+    Supervised contrastive loss with optional SoftCL weighting.
+
+    默认（soft=False）行为与原实现完全一致：
+    - z 归一化；
+    - 相似度 sim = (z z^T) / tau；
+    - 同标签为正样本（去对角线），按 log-softmax 后对正样本平均；
+
+    当 soft=True：
+    - 基于标签构造 dist (同类=0，异类=1)；
+    - soft_pos = exp(-dist / label_tau) 并置零对角线；
+    - 对每行 soft_pos 归一化；
+    - 使用 soft_pos 对每行 log 概率加权求和（SoftCL）。
+
+    鲁棒性：当 z 无效或 batch<2 时返回 0（与 y 在同一设备）。
+    """
+    # —— 无效输入与 batch 过小 ——
     if z is None or z.numel() == 0:
         return torch.tensor(0.0, device=y.device)
+    if z.dim() == 0 or z.size(0) < 2:
+        return torch.tensor(0.0, device=y.device)
+
+    # 归一化与相似度
     z = F.normalize(z, dim=-1)
     sim = torch.mm(z, z.t()) / max(tau, 1e-6)
-    y = y.view(-1, 1)
-    mask_pos = torch.eq(y, y.t()).float()
-    mask_pos = mask_pos - torch.eye(y.size(0), device=y.device)
+
+    # 为了与旧实现保持一致，logits/exp_logits 的处理保持不变
     logits = sim - torch.max(sim, dim=1, keepdim=True).values
-    exp_logits = torch.exp(logits) * (1 - torch.eye(y.size(0), device=y.device))
-    log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-9)
-    mean_log_prob_pos = (mask_pos * log_prob).sum(1) / (mask_pos.sum(1) + 1e-9)
-    return -mean_log_prob_pos.mean()
+    # 去除自身参与：通过 (1 - I) 屏蔽对角线
+    I = torch.eye(z.size(0), device=z.device)
+    exp_logits = torch.exp(logits) * (1 - I)
+    log_den = torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-9)
+    log_prob = logits - log_den  # 每行 log-softmax（去掉对角线的归一化）
+
+    # 硬对比（与现有实现完全一致）
+    if not soft:
+        yv = y.view(-1, 1)
+        mask_pos = torch.eq(yv, yv.t()).float()
+        mask_pos = mask_pos - I  # 去除对角线
+        denom = (mask_pos.sum(1) + 1e-9)
+        mean_log_prob_pos = (mask_pos * log_prob).sum(1) / denom
+        return -mean_log_prob_pos.mean()
+
+    # 软对比（SoftCL）
+    # 距离矩阵：同类=0，异类=1
+    yv = y.view(-1, 1)
+    dist = (yv != yv.t()).float()
+    lt = max(float(label_tau), 1e-6)
+    soft_pos = torch.exp(-dist / lt)
+    # 去除对角线，避免自身作“正样本”
+    soft_pos = soft_pos * (1 - I)
+    # 行归一化（若全零则保持为零行，分母加小常数防止除零告警）
+    soft_pos = soft_pos / (soft_pos.sum(dim=1, keepdim=True) + 1e-12)
+    # 用软权重加权每行的 log 概率
+    weighted_log = (soft_pos * log_prob).sum(1)
+    return -weighted_log.mean()
 
 
 def cosine_align_loss(z_a: Optional[torch.Tensor], z_b: Optional[torch.Tensor]) -> torch.Tensor:
@@ -92,6 +148,37 @@ def cosine_align_loss(z_a: Optional[torch.Tensor], z_b: Optional[torch.Tensor]) 
     za = F.normalize(z_a, dim=-1); zb = F.normalize(z_b, dim=-1)
     cos = (za * zb).sum(dim=-1)
     return (1.0 - cos).mean()
+
+
+def ortho_penalty(z_shared: Optional[torch.Tensor],
+                  z_private: Optional[torch.Tensor]) -> torch.Tensor:
+    """
+    正交约束损失：对每个样本的 shared 与 private 表示做余弦相似度，取平方再对 batch 平均。
+    - 输入任一为 None 时返回 0（设备与已有张量一致）。
+    - 不做缩放，权重由外部 lmbd_ortho 控制。
+    """
+    if z_shared is None and z_private is None:
+        return torch.tensor(0.0)
+    if z_shared is None:
+        return torch.tensor(0.0, device=z_private.device)
+    if z_private is None:
+        return torch.tensor(0.0, device=z_shared.device)
+    zs = F.normalize(z_shared, dim=-1)
+    zp = F.normalize(z_private, dim=-1)
+    # 若 batch 尺寸不一致，按最小对齐（理论上应一致）
+    if zs.size(0) != zp.size(0):
+        n = min(zs.size(0), zp.size(0))
+        zs = zs[:n]
+        zp = zp[:n]
+    
+    # 确保维度一致才能做点积
+    if zs.size(1) != zp.size(1):
+        min_d = min(zs.size(1), zp.size(1))
+        zs = zs[:, :min_d]
+        zp = zp[:, :min_d]
+        
+    cos = (zs * zp).sum(dim=-1)
+    return (cos ** 2).mean()
 
 
 # ==========================
@@ -223,28 +310,99 @@ def train_loop(args):
     cnt_all = Counter(labels_all)
     print("全数据集分布：")
     for c in sorted(cnt_all.keys()): print(f"  类别 {c:2d}: {cnt_all[c]}")
-    idx = np.arange(len(dataset))
-    train_idx, test_idx = train_test_split(
-        idx, test_size=0.3, random_state=args.seed, stratify=labels_all
-    )
-    print("[4] 划分训练/测试集.")
-    cnt_tr = Counter([labels_all[i] for i in train_idx]); cnt_te = Counter([labels_all[i] for i in test_idx])
-    print("训练集分布：")
+    # =============================
+    # 相邻样本不落同一子集（窗口级交错分配，分布一致）
+    # =============================
+    window2file = getattr(dataset, '_window2file', [])
+    file_labels = getattr(dataset, '_labels', [])
+    if not window2file or not file_labels:
+        raise RuntimeError('[Split] 缺少文件级映射(_window2file/_labels)，无法进行无重叠划分。')
+
+    # 交错分配：对每个文件的窗口按时间顺序交错到 train/val/test，确保相邻不在同一子集
+    files = np.arange(len(file_labels))
+    data_fraction = float(getattr(args, 'data_fraction', 1.0))
+    base_files = files
+    if 0.0 < data_fraction < 1.0:
+        # 子集文件选择不分层，避免稀有类导致报错；分布一致通过窗口级交错实现
+        base_files, _ = train_test_split(files, train_size=data_fraction, random_state=args.seed, stratify=None)
+        print(f"[Subset-Files] 使用 {len(base_files)}/{len(files)} 个文件 (~{data_fraction*100:.1f}%).")
+
+    # 模式：严格相邻不同子集 + 比例 7:1.5:1.5（约等于 0.7/0.15/0.15）
+    ratios = {'train': 0.7, 'val': 0.15, 'test': 0.15}
+    subsets = ['train', 'val', 'test']
+    train_idx, val_idx, test_idx = [], [], []
+    # 全局目标配额，避免“每文件四舍五入”造成累计误差
+    all_wins = [w for w in range(len(window2file)) if window2file[w] in set(base_files)]
+    total_n = len(all_wins)
+    global_target = {
+        'train': int(round(total_n * ratios['train'])),
+        'val':   int(round(total_n * ratios['val'])),
+        'test':  int(round(total_n * ratios['test']))
+    }
+    # 调整总和到 total_n
+    gdiff = total_n - sum(global_target.values())
+    if gdiff != 0:
+        for s in sorted(subsets, key=lambda k: ratios[k], reverse=True):
+            if gdiff == 0: break
+            global_target[s] += 1 if gdiff > 0 else -1
+            gdiff += -1 if gdiff > 0 else 1
+    global_used = {s: 0 for s in subsets}
+    # 遍历文件，内部仍保持相邻不同，优先满足全局剩余配额
+    for f in base_files:
+        wins = [w for w, fid in enumerate(window2file) if fid == f]
+        prev = None
+        for w in wins:
+            # 候选按全局剩余配额排序，且不等于 prev
+            candidates = sorted(subsets, key=lambda s: (global_target[s] - global_used[s], ratios[s]), reverse=True)
+            chosen = None
+            for s in candidates:
+                if s == prev: continue
+                if global_used[s] < global_target[s]:
+                    chosen = s
+                    break
+            if chosen is None:
+                # 若所有候选已满或与 prev 冲突，选择与 prev 不同的集合（允许略超配额）
+                for s in subsets:
+                    if s != prev:
+                        chosen = s
+                        break
+            global_used[chosen] += 1
+            prev = chosen
+            if chosen == 'train':
+                train_idx.append(w)
+            elif chosen == 'val':
+                val_idx.append(w)
+            else:
+                test_idx.append(w)
+
+    print('[4] 窗口级交错划分 (相邻不同行, 近似均衡).')
+    print(f"窗口数: train={len(train_idx)} val={len(val_idx)} test={len(test_idx)}")
+
+    cnt_tr = Counter([labels_all[i] for i in train_idx])
+    cnt_val = Counter([labels_all[i] for i in val_idx])
+    cnt_te  = Counter([labels_all[i] for i in test_idx])
+    print('训练集分布：')
     for c in sorted(cnt_tr.keys()): print(f"  类别 {c:2d}: {cnt_tr[c]}")
-    print("测试集分布：")
+    print('验证集分布：')
+    for c in sorted(cnt_val.keys()): print(f"  类别 {c:2d}: {cnt_val[c]}")
+    print('测试集分布：')
     for c in sorted(cnt_te.keys()): print(f"  类别 {c:2d}: {cnt_te[c]}")
 
     # [5] DataLoader
     print("[5] 构建 DataLoader.")
-    train_set = Subset(dataset, train_idx.tolist())
-    test_set  = Subset(dataset, test_idx.tolist())
+    train_set = Subset(dataset, train_idx)
+    val_set   = Subset(dataset, val_idx)
+    test_set  = Subset(dataset, test_idx)
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
                               num_workers=getattr(args,'num_workers',8),
+                              pin_memory=True, persistent_workers=False)
+    val_loader   = DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
+                              num_workers=getattr(args,'test_workers',0),
                               pin_memory=True, persistent_workers=False)
     test_loader  = DataLoader(test_set,  batch_size=args.batch_size, shuffle=False,
                               num_workers=getattr(args,'test_workers',0),
                               pin_memory=True, persistent_workers=False)
-    print(f"[5] DataLoader 构建完成。Train nw={getattr(args,'num_workers',8)} | Test nw={getattr(args,'test_workers',0)}")
+    print(f"[5] DataLoader 构建完成。Train nw={getattr(args,'num_workers',8)} | Val nw={getattr(args,'test_workers',0)} | Test nw={getattr(args,'test_workers',0)}")
 
     # [6] 初始化模型 —— 自动别名映射（含必需的 seq_len/通道数/edge_attr_dim）
     print("[6] 初始化模型 (HeteroGraph + edge_attr + Contrastive heads).")
@@ -311,6 +469,12 @@ def train_loop(args):
     tau         = float(getattr(args,'tau',0.1))
     tau_aug     = float(getattr(args,'tau_aug',0.1))  # 预留
 
+    # ---------- 新增：正交与 SoftCL 超参 ----------
+    lmbd_ortho      = float(getattr(args, 'lmbd_ortho', 0.0))
+    use_soft_supcon = bool(getattr(args, 'use_soft_supcon', False))
+    soft_label_tau  = float(getattr(args, 'soft_label_tau', 0.5))
+    shared_ratio    = float(getattr(args, 'shared_ratio', 0.5))
+
     # ---------- AMP / 梯度累积 ----------
     use_amp = bool(getattr(args,'use_amp',True))
     amp_dev = 'cuda' if (str(args.device).startswith('cuda') and torch.cuda.is_available()) else 'cpu'
@@ -325,7 +489,9 @@ def train_loop(args):
 
     if getattr(args, 'resume', '') and os.path.isfile(args.resume):
         try:
-            state = torch.load(args.resume, map_location='cpu')
+            # PyTorch 2.6 默认 weights_only=True 会阻止旧版 checkpoint（含优化器/调度器状态）恢复。
+            # 这里显式禁用该限制，前提是我们信任本地保存的 ckpt 文件。
+            state = torch.load(args.resume, map_location='cpu', weights_only=False)
             model.load_state_dict(state['model'], strict=True)
             optimizer.load_state_dict(state['optimizer'])
             if use_amp and state.get('scaler'):
@@ -340,21 +506,6 @@ def train_loop(args):
         except Exception as e:
             print(f"[WARN] 恢复失败：{e}")
 
-    # best_acc = -1.0
-    # if getattr(args,'resume',''):
-    #     try:
-    #         state = torch.load(args.resume, map_location='cpu')
-    #         model.load_state_dict(state.get('model', {}), strict=False)
-    #         if 'optimizer' in state:
-    #             optimizer.load_state_dict(state['optimizer'])
-    #         best_acc = float(state.get('best_acc', -1.0))
-    #         print(f"[*] 已从 {args.resume} 恢复。best_acc={best_acc:.4f}")
-    #     except Exception as e:
-    #         print(f"[WARN] 恢复失败：{e}")
-
-
-
-
     # [8] 训练
     print(f"[8] 开始训练主循环（{ce_name}+SupCon+XMod+Aug | AMP 与梯度累积）.")
     warned_no_embed = False
@@ -362,7 +513,7 @@ def train_loop(args):
 
     for epoch in range(start_epoch, args.epochs+1):
         model.train()
-        epoch_loss=ce_sum=sup_sum=xmd_sum=aug_sum=0.0; step_count=0
+        epoch_loss=ce_sum=sup_sum=xmd_sum=aug_sum=ortho_sum=0.0; step_count=0
         pbar = tqdm(train_loader, total=len(train_loader), desc=f"Epoch {epoch:03d}")
         optimizer.zero_grad(set_to_none=True)
 
@@ -384,28 +535,57 @@ def train_loop(args):
                     print(f"[Probe] use_aug={getattr(args,'use_aug',True)} | "
                           f"z_fused={shp(z_fused)}, z_op={shp(z_op)}, z_dose={shp(z_dose)}")
 
+                # -------------- shared/private 分解 --------------
+                z_shared = None
+                z_op_sh = z_op_pr = None
+                z_dose_sh = z_dose_pr = None
+
+                can_split = (z_op is not None) and (z_dose is not None)
+                if can_split:
+                    d_op = z_op.size(-1)
+                    d_ds = z_dose.size(-1)
+                    if (d_op == d_ds):
+                        # 共享:私有 按 shared_ratio 切分，落在 [1, d-1]
+                        h = int(d_op * shared_ratio)
+                        h = max(1, min(d_op - 1, h))
+                        if h <= 0 or h >= d_op:
+                            h = d_op // 2  # 兜底回退为对半分
+                        z_op_sh, z_op_pr = z_op[:, :h], z_op[:, h:]
+                        z_dose_sh, z_dose_pr = z_dose[:, :h], z_dose[:, h:]
+                        z_shared = 0.5 * (z_op_sh + z_dose_sh)
+                    else:
+                        # 维度不合适，退化使用 z_fused 作为 shared
+                        z_shared = z_fused if z_fused is not None else None
+                else:
+                    # 缺少某一模态，退化使用 z_fused 作为 shared
+                    z_shared = z_fused if z_fused is not None else None
+
                 ce = criterion_ce(logits, batch.y)
 
                 # 三个附加损失
                 sup = torch.tensor(0.0, device=args.device)
                 xmd = torch.tensor(0.0, device=args.device)
                 aug = torch.tensor(0.0, device=args.device)
+                ortho = torch.tensor(0.0, device=args.device)
 
                 # 嵌入缺失一次性告警
                 if (lmbd_supcon>0 or lmbd_xmod>0 or lmbd_aug>0) and (z_fused is None and z_op is None and z_dose is None) and (not warned_no_embed):
                     print("[WARN] 模型 forward 未返回嵌入（z_fused/z_op/z_dose），对比/一致性损失将被跳过。")
                     warned_no_embed=True
 
-                # SupCon
-                if lmbd_supcon>0 and z_fused is not None:
-                    sup = supcon_loss(z_fused, batch.y, tau=tau) * lmbd_supcon
+                # SupCon（优先使用 shared，支持 SoftCL）
+                if lmbd_supcon>0 and z_shared is not None:
+                    sup = supcon_loss(z_shared, batch.y, tau=tau,
+                                      soft=use_soft_supcon, label_tau=soft_label_tau) * lmbd_supcon
 
-                # XMod（需同时有 z_op 与 z_dose）
+                # XMod（优先对 shared 子空间对齐，退化到原 z_op/z_dose）
                 if lmbd_xmod>0:
-                    if (z_op is not None) and (z_dose is not None):
+                    if (z_op_sh is not None) and (z_dose_sh is not None):
+                        xmd = cosine_align_loss(z_op_sh, z_dose_sh) * lmbd_xmod
+                    elif (z_op is not None) and (z_dose is not None):
                         xmd = cosine_align_loss(z_op, z_dose) * lmbd_xmod
                     elif not warned_missing_xmod:
-                        print("[WARN] XMD 启用但 z_op 或 z_dose 缺失，已跳过跨模态一致性；请检查模型 forward 的返回。")
+                        print("[WARN] XMD 启用但缺少可对齐的表示（shared 或原始 z_op/z_dose），已跳过跨模态一致性；请检查模型 forward 的返回。")
                         warned_missing_xmod = True
 
                 # AUG（轻量一致性；默认 Dropout，也可切到噪声）
@@ -423,7 +603,20 @@ def train_loop(args):
                     # 用同一风格的“1-cos”对齐；如需温度，可替换为 (1 - cos/τ_aug) 等自定义形式
                     aug = (1.0 - (za * zb).sum(dim=-1)).mean() * lmbd_aug
 
-                loss = (ce + sup + xmd + aug) / grad_accum
+                # 正交损失（需要成功拆分出 private 子空间）
+                if lmbd_ortho > 0:
+                    o_sum = torch.tensor(0.0, device=args.device)
+                    cnt = 0
+                    if (z_op_sh is not None) and (z_op_pr is not None):
+                        o_sum = o_sum + ortho_penalty(z_op_sh, z_op_pr)
+                        cnt += 1
+                    if (z_dose_sh is not None) and (z_dose_pr is not None):
+                        o_sum = o_sum + ortho_penalty(z_dose_sh, z_dose_pr)
+                        cnt += 1
+                    if cnt > 0:
+                        ortho = o_sum * lmbd_ortho
+
+                loss = (ce + sup + xmd + aug + ortho) / grad_accum
 
             # 反传与优化
             if use_amp and amp_dev=='cuda':
@@ -441,14 +634,16 @@ def train_loop(args):
             sup_sum += float((sup).detach().cpu())
             xmd_sum += float((xmd).detach().cpu())
             aug_sum += float((aug).detach().cpu())
+            ortho_sum += float((ortho).detach().cpu())
             step_count += 1
             pbar.set_postfix(loss=(loss.item()*grad_accum),
-                             ce=ce.item(), sup=float(sup), xmd=float(xmd), aug=float(aug))
+                             ce=ce.item(), sup=float(sup), xmd=float(xmd), aug=float(aug), ortho=float(ortho))
 
         # [9] 评估
         acc = evaluate(model, test_loader, args.device, use_amp=use_amp)
         print(f"[Epoch {epoch:03d}] TrainLoss:{epoch_loss/max(1,step_count):.4f} | CE:{ce_sum/max(1,step_count):.4f} "
-              f"Sup:{sup_sum/max(1,step_count):.4f} XMD:{xmd_sum/max(1,step_count):.4f} AUG:{aug_sum/max(1,step_count):.4f} | "
+              f"Sup:{sup_sum/max(1,step_count):.4f} XMD:{xmd_sum/max(1,step_count):.4f} AUG:{aug_sum/max(1,step_count):.4f} "
+              f"ORTH:{ortho_sum/max(1,step_count):.4f} | "
               f"Test Acc:{acc:.4f} | Best:{(-1.0 if epoch==1 and best_acc<0 else best_acc):.4f}")
 
         # [10] 保存
