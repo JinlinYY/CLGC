@@ -42,6 +42,20 @@ try:
 except OSError:
     plt.style.use("seaborn-whitegrid")
 
+# 设置全局字体
+# 优先尝试 Times New Roman，若无则回退到 DejaVu Serif (类似 Times 的衬线字体)
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Times New Roman', 'DejaVu Serif', 'Liberation Serif', 'serif']
+plt.rcParams['mathtext.fontset'] = 'stix'  # 数学公式字体兼容
+
+# 增大全局字号
+plt.rcParams['font.size'] = 14
+plt.rcParams['axes.labelsize'] = 16
+plt.rcParams['axes.titlesize'] = 18
+plt.rcParams['xtick.labelsize'] = 14
+plt.rcParams['ytick.labelsize'] = 14
+plt.rcParams['legend.fontsize'] = 14
+
 
 # ---------------- 工具函数 ----------------
 def _infer_best_ckpt(save_dir: str, exp_name: str) -> Optional[str]:
@@ -168,13 +182,18 @@ def _map_model_args(args, dataset) -> Tuple[dict, dict]:
 def _evaluate_collect(model: nn.Module,
                       loader: DataLoader,
                       device: str,
-                      use_amp: bool = True):
-    """收集 logits、z_fused、y_true、y_pred。"""
+                      use_amp: bool = True,
+                      embedding_mode: str = "fused",
+                      shared_ratio: float = 0.5):
+    """收集 logits、选定嵌入(z_fused或shared)、y_true、y_pred。
+    embedding_mode: 'fused' | 'shared'
+    shared_ratio: 用于 'shared' 模式下的 shared/private 切分比例
+    """
     model.eval()
     amp_dev = 'cuda' if (str(device).startswith('cuda') and torch.cuda.is_available()) else 'cpu'
     enabled = bool(use_amp and amp_dev == 'cuda')
 
-    logits_list, zfused_list, y_list, yhat_list = [], [], [], []
+    logits_list, zembed_list, y_list, yhat_list = [], [], [], []
     for batch in tqdm(loader, desc="Evaluating"):
         batch = batch.to(device)
         with autocast(device_type=amp_dev, enabled=enabled):
@@ -182,19 +201,35 @@ def _evaluate_collect(model: nn.Module,
             if isinstance(out, (tuple, list)):
                 logits = out[0]
                 z_fused = out[1] if len(out) > 1 else None
+                z_op    = out[2] if len(out) > 2 else None
+                z_dose  = out[3] if len(out) > 3 else None
             else:
                 logits = out
                 z_fused = None
+                z_op = None
+                z_dose = None
             pred = logits.argmax(dim=1)
 
         logits_list.append(logits.detach().cpu())
-        if z_fused is not None:
-            zfused_list.append(z_fused.detach().cpu())
+        # 选择可视化用的嵌入
+        z_sel = None
+        if embedding_mode == "shared" and (z_op is not None) and (z_dose is not None) and (z_op.size(-1) == z_dose.size(-1)):
+            d = z_op.size(-1)
+            h = int(d * shared_ratio)
+            h = max(1, min(d - 1, h))
+            try:
+                z_sel = 0.5 * (z_op[:, :h] + z_dose[:, :h])
+            except Exception:
+                z_sel = None
+        if z_sel is None:
+            z_sel = z_fused
+        if z_sel is not None:
+            zembed_list.append(z_sel.detach().cpu())
         y_list.append(batch.y.detach().cpu())
         yhat_list.append(pred.detach().cpu())
 
     logits_all = torch.cat(logits_list, dim=0).numpy() if logits_list else np.zeros((0, 1), dtype=np.float32)
-    zfused_all = torch.cat(zfused_list, dim=0).numpy() if zfused_list else None
+    zfused_all = torch.cat(zembed_list, dim=0).numpy() if zembed_list else None
     y_true = torch.cat(y_list, dim=0).numpy() if y_list else np.zeros((0,), dtype=np.int64)
     y_pred = torch.cat(yhat_list, dim=0).numpy() if yhat_list else np.zeros((0,), dtype=np.int64)
     return logits_all, zfused_all, y_true, y_pred
@@ -240,8 +275,15 @@ def _plot_tsne(z: np.ndarray, y: np.ndarray, id2label: Optional[Dict[int, str]],
         return
     # 自动约束 perplexity
     perplexity = max(5.0, min(perplexity, (n - 1) / 3))
+    # sklearn 1.2+ 中 TSNE 参数可能有变，若报错 n_iter 可尝试改为 n_iter_ 或直接移除（通常 n_iter 仍支持，但部分版本可能严格）
+    # 实际上 sklearn TSNE 一直支持 n_iter，报错可能是因为使用了 cuml.TSNE 或其他库？
+    # 或者 sklearn 版本极低/极高？
+    # 稳妥起见，这里保留 n_iter 但如果报错请检查 sklearn 版本。
+    # 修正：用户报错 TypeError: TSNE.__init__() got an unexpected keyword argument 'n_iter'
+    # 这说明当前环境的 TSNE 不接受 n_iter 参数（可能是 openTSNE 或非常旧/新的 sklearn 变体？）
+    # 既然报错了，我们直接移除 n_iter（使用默认值 1000）
     emb2d = TSNE(n_components=2, perplexity=perplexity, learning_rate=lr,
-                 n_iter=n_iter, init="random", random_state=seed,
+                 init="random", random_state=seed,
                  metric="euclidean").fit_transform(z)
 
     classes = np.unique(y)
@@ -280,16 +322,16 @@ def _plot_cm(cm: np.ndarray, labels: List[str], out_png: str, title: str = "Conf
 
     tick = np.arange(len(labels))
     ax.set_xticks(tick)
-    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=11)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=14)
     ax.set_yticks(tick)
-    ax.set_yticklabels(labels, fontsize=11)
+    ax.set_yticklabels(labels, fontsize=13.8)
 
     thresh = cm.max() / 2.0 if cm.size > 0 else 0.0
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(j, i, str(cm[i, j]),
-                    ha="center", va="center",
-                    color="white" if cm[i, j] > thresh else "black", fontsize=8)
+    # for i in range(cm.shape[0]):
+    #     for j in range(cm.shape[1]):
+    #         ax.text(j, i, str(cm[i, j]),
+    #                 ha="center", va="center",
+    #                 color="white" if cm[i, j] > thresh else "black", fontsize=5)
     ax.set_ylabel("True label")
     ax.set_xlabel("Predicted label")
     plt.tight_layout()
@@ -301,7 +343,7 @@ def _plot_cm(cm: np.ndarray, labels: List[str], out_png: str, title: str = "Conf
 def _plot_roc(prob: np.ndarray, y_true: np.ndarray, num_classes: int,
               id2label: Optional[Dict[int, str]], out_png: str):
     os.makedirs(os.path.dirname(out_png) or ".", exist_ok=True)
-    fig, ax = plt.subplots(figsize=(6.4, 5.4), dpi=300)
+    fig, ax = plt.subplots(figsize=(6, 5), dpi=300)
     cmap = cm.get_cmap("tab20", num_classes)
 
     if num_classes == 2:
@@ -322,27 +364,31 @@ def _plot_roc(prob: np.ndarray, y_true: np.ndarray, num_classes: int,
 
     ax.plot([0, 1], [0, 1], ls=":", lw=3, color="grey")
     ax.set_xlim(-0.05, 1.05); ax.set_ylim(-0.05, 1.05)
-    ax.set_xlabel("False Positive Rate", fontsize=12)
-    ax.set_ylabel("True Positive Rate", fontsize=12)
-    ax.set_title("ROC Curve", fontsize=13)
+    ax.set_xlabel("False Positive Rate", fontsize=16)
+    ax.set_ylabel("True Positive Rate", fontsize=16)
+    ax.set_title("ROC Curve", fontsize=18)
     ax.grid(True, ls="--", lw=3, alpha=0.4)
 
     for spine in ax.spines.values():
-        spine.set_edgecolor("black"); spine.set_linewidth(1.0)
+        spine.set_edgecolor("black"); spine.set_linewidth(2.0)
 
-    leg = ax.legend(fontsize=9, loc="lower right", frameon=True, ncol=2)
-    leg.get_frame().set_edgecolor("grey"); leg.get_frame().set_linewidth(1.0)
-    leg.get_frame().set_facecolor("white")
-
+    # leg = ax.legend(fontsize=9, loc="lower right", frameon=True, ncol=2)
+    # leg.get_frame().set_edgecolor("grey"); leg.get_frame().set_linewidth(1.0)
+    # leg.get_frame().set_facecolor("white")
+    
+    # 获取图例句柄和标签，用于外部绘制
+    handles, labels = ax.get_legend_handles_labels()
+    
     plt.tight_layout()
     plt.savefig(out_png, bbox_inches="tight")
     plt.close(fig)
+    return handles, labels
 
 
 def _plot_pr(prob: np.ndarray, y_true: np.ndarray, num_classes: int,
              id2label: Optional[Dict[int, str]], out_png: str):
     os.makedirs(os.path.dirname(out_png) or ".", exist_ok=True)
-    fig, ax = plt.subplots(figsize=(6.4, 5.4), dpi=300)
+    fig, ax = plt.subplots(figsize=(6, 5), dpi=300)
     cmap = cm.get_cmap("tab20", num_classes)
 
     if num_classes == 2:
@@ -363,21 +409,46 @@ def _plot_pr(prob: np.ndarray, y_true: np.ndarray, num_classes: int,
                 label=f"micro (AP={ap_m:.3f})")
 
     ax.set_xlim(-0.05, 1.05); ax.set_ylim(-0.05, 1.05)
-    ax.set_xlabel("Recall", fontsize=12)
-    ax.set_ylabel("Precision", fontsize=12)
-    ax.set_title("Precision–Recall Curve", fontsize=13)
+    ax.set_xlabel("Recall", fontsize=16)
+    ax.set_ylabel("Precision", fontsize=16)
+    ax.set_title("Precision–Recall Curve", fontsize=18)
     ax.grid(True, ls="--", lw=3, alpha=0.4)
 
     for spine in ax.spines.values():
-        spine.set_edgecolor("black"); spine.set_linewidth(1.0)
+        spine.set_edgecolor("black"); spine.set_linewidth(2.0)
 
-    leg = ax.legend(fontsize=9, loc="lower left", frameon=True, ncol=2)
-    leg.get_frame().set_edgecolor("grey"); leg.get_frame().set_linewidth(1.0)
-    leg.get_frame().set_facecolor("white")
+    # leg = ax.legend(fontsize=9, loc="lower left", frameon=True, ncol=2)
+    # leg.get_frame().set_edgecolor("grey"); leg.get_frame().set_linewidth(1.0)
+    # leg.get_frame().set_facecolor("white")
+    
+    # 获取图例句柄和标签
+    handles, labels = ax.get_legend_handles_labels()
 
     plt.tight_layout()
     plt.savefig(out_png, bbox_inches="tight")
     plt.close(fig)
+    return handles, labels
+
+def _plot_shared_legend(handles, labels, out_png: str):
+    """绘制一个单独的图例图片"""
+    # 创建一个新的 figure，专门用来放 legend
+    # 大小可以根据类别数量动态调整，这里给一个大概的尺寸
+    n_cols = 4  # 列数
+    n_rows = (len(labels) + n_cols - 1) // n_cols
+    fig_leg = plt.figure(figsize=(n_cols * 2.5, n_rows * 0.5), dpi=300)
+    ax_leg = fig_leg.add_subplot(111)
+    ax_leg.axis('off')
+    
+    leg = ax_leg.legend(handles, labels, loc='center', ncol=n_cols, frameon=True, fontsize=14)
+    leg.get_frame().set_edgecolor("grey")
+    leg.get_frame().set_linewidth(1.0)
+    leg.get_frame().set_facecolor("white")
+    
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_png) or ".", exist_ok=True)
+    plt.savefig(out_png, bbox_inches='tight')
+    plt.close(fig_leg)
+
 
 
 # ---------- 读取 ckpt（带 allowlist + 回退） ----------
@@ -416,13 +487,13 @@ def _load_ckpt_state(ckpt_path: str, need_meta: bool) -> Tuple[dict, Optional[di
     except Exception as e:
         print(f"[Eval][WARN] weights_only=True 加载失败：{e}")
         print("[Eval][WARN] 将回退到 weights_only=False 加载（需信任该 checkpoint）。")
-        state_weights = torch.load(ckpt_path, map_location="cpu")
+        state_weights = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
     # 2) 若需要 meta（为了读取 test_idx 等），尽量再读一次“全量”状态
     state_meta = None
     if need_meta:
         try:
-            state_meta = torch.load(ckpt_path, map_location="cpu")  # 可能含 test_idx/splits
+            state_meta = torch.load(ckpt_path, map_location="cpu", weights_only=False)  # 可能含 test_idx/splits
             print("[Eval] 已加载 checkpoint 全量元数据（含 test_idx 等，若存在）。")
         except Exception as e:
             print(f"[Eval][WARN] 读取 checkpoint 元数据失败：{e}，将无法使用 ckpt 内置测试划分。")
@@ -565,8 +636,10 @@ def eval_only(args):
         print("[Eval] state_dict 多余键：", missing.unexpected_keys)
 
     # 5) 推理收集
+    embedding_mode = 'shared' if bool(getattr(args, 'tsne_use_shared', False)) else 'fused'
     logits_all, zfused_all, y_true, y_pred = _evaluate_collect(
-        model, test_loader, device=device, use_amp=getattr(args, 'use_amp', True)
+        model, test_loader, device=device, use_amp=getattr(args, 'use_amp', True),
+        embedding_mode=embedding_mode, shared_ratio=float(getattr(args, 'shared_ratio', 0.5))
     )
 
     # 6) 指标
@@ -646,12 +719,23 @@ def eval_only(args):
         print("[Eval][WARN] 模型未返回 z_fused，无法绘制 t-SNE。")
 
     if prob is not None:
+        handles, labels = None, None
         if getattr(args, 'save_roc_png', ''):
-            _plot_roc(prob, y_true, real_num_classes, id2label, args.save_roc_png)
+            h, l = _plot_roc(prob, y_true, real_num_classes, id2label, args.save_roc_png)
+            if handles is None: handles, labels = h, l
             print(f"[Eval] ROC 曲线已保存到: {args.save_roc_png}")
         if getattr(args, 'save_pr_png', ''):
-            _plot_pr(prob, y_true, real_num_classes, id2label, args.save_pr_png)
+            h, l = _plot_pr(prob, y_true, real_num_classes, id2label, args.save_pr_png)
+            if handles is None: handles, labels = h, l
             print(f"[Eval] PR 曲线已保存到: {args.save_pr_png}")
+        
+        # 绘制共享图例
+        if handles is not None and (getattr(args, 'save_roc_png', '') or getattr(args, 'save_pr_png', '')):
+            # 假设图例保存在 ROC 或 PR 同级目录下，命名为 legend.png
+            base_dir = os.path.dirname(args.save_roc_png or args.save_pr_png)
+            legend_path = os.path.join(base_dir, "legend.png")
+            _plot_shared_legend(handles, labels, legend_path)
+            print(f"[Eval] 共享图例已保存到: {legend_path}")
     else:
         if getattr(args, 'save_roc_png', '') or getattr(args, 'save_pr_png', ''):
             print("[Eval][WARN] 未得到概率分布(probabilities)，无法绘制 ROC/PR。")
