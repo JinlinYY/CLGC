@@ -18,16 +18,16 @@ def build_argparser():
 
     # ================= 基本路径与数据集 =================
     p.add_argument("--dataset", type=str, default="NPS", help="NPS / TFF / auto")
-    p.add_argument('--op_dir', type=str, default='/tmp/pycharm_project_856/Data/54/Operation_csv_data',
+    p.add_argument('--op_dir', type=str, default='/tmp/pycharm_project_156/Data/Operation_csv_data',
                    help='Operation 数据或 TFF 根目录（a..g 子文件夹）')
-    p.add_argument('--dose_dir', type=str, default='/tmp/pycharm_project_856/Data/54/Dose_csv_data',
+    p.add_argument('--dose_dir', type=str, default='/tmp/pycharm_project_156/Data/Dose_csv_data',
                    help='Dose 数据目录（TFF 单模态可忽略）')
 
     # ================= 滑窗 / 采样参数 =================
     p.add_argument("--op_interval", type=int, default=10)
     p.add_argument("--dose_interval", type=int, default=60)
     p.add_argument("--dose_window_steps", type=int, default=10)
-    p.add_argument("--dose_stride_steps", type=int, default=8)
+    p.add_argument("--dose_stride_steps", type=int, default=1)
     p.add_argument("--downsample_mode", type=str, default="pick",
                    choices=["pick", "mean", "sum", "none"])
 
@@ -46,16 +46,16 @@ def build_argparser():
     # ---------- 模型结构（与训练保持一致） ----------
     p.add_argument("--trans_dim", type=int, default=256)
     p.add_argument("--trans_layers", type=int, default=2)
-    p.add_argument("--nhead", type=int, default=4)
+    p.add_argument("--nhead", type=int, default=8)
     p.add_argument("--gnn_hidden", type=int, default=512)
     p.add_argument("--gnn_layers", type=int, default=2)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--num_classes_override", type=int, default=None)
 
     # ================= 运行时参数 =================
-    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--num_workers", type=int, default=12)
-    p.add_argument("--seed", type=int, default=15)
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str,
                    default="cuda:0" if torch.cuda.is_available() else "cpu")
     p.add_argument("--use_amp", type=str2bool, default=True)
@@ -63,15 +63,20 @@ def build_argparser():
     # ================= 评估行为开关 =================
     p.add_argument("--force_resplit", type=str2bool, default=True,
                    help="是否强制忽略 ckpt 内置 test_idx、每次随机重划分测试集（默认 True）")
+    # t-SNE 嵌入选择（可选用 shared 表示用于可视化；默认用 z_fused）
+    p.add_argument("--tsne_use_shared", type=str2bool, default=False,
+                   help="若为 True，则在可视化中使用 shared 表示（基于 z_op/z_dose 按 shared_ratio 切分并平均）")
+    p.add_argument("--shared_ratio", type=float, default=0.15,
+                   help="shared/private 维度切分比例（0-1，默认0.5，对半分；仅影响 tsne_use_shared=True 时）")
 
     # ================= checkpoint 相关 =================
     p.add_argument("--save_dir", type=str, default="")
     p.add_argument("--exp_name", type=str, default="")
-    p.add_argument("--resume", type=str, default="/tmp/pycharm_project_856/checkpoints/NPS54-(残差MLP-Adam)_best.pt",
+    p.add_argument("--resume", type=str, default="/tmp/pycharm_project_156/checkpoints/NPS18-(改进测试中)_2025-11-26_01-50-39/NPS18-(改进测试中)_best_09401.pt",
                    help="checkpoint 路径或目录（可不填，将尝试从 save_dir/exp_name 推断 *_best.pt）")
 
     # ================= 各类输出文件 =================
-    OUT_DIR = "eval_outputs/NPS54-残差MLP-0.3(best)"
+    OUT_DIR = "/tmp/pycharm_project_156/eval_outputs/NPS18-test6"
     p.add_argument("--save_report", type=str,
                    default=f"{OUT_DIR}/report.txt", help="保存指标报告 (.txt)")
     p.add_argument("--save_pred", type=str,
@@ -93,7 +98,7 @@ def build_argparser():
     p.add_argument("--tsne_iter", type=int, default=1000)
 
     # 当 ckpt 里没有 test_idx 或 force_resplit 时，兜底随机划分
-    p.add_argument("--test_ratio", type=float, default=0.4)
+    p.add_argument("--test_ratio", type=float, default=0.3)
 
     return p
 
