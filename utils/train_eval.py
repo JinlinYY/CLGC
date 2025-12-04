@@ -1,11 +1,6 @@
 # utils/train_eval.py
 # -*- coding: utf-8 -*-
-"""
-训练与评估（NPS/TFF 通用，异构图 + 边属性 + 对比/一致性）
-- SupCon 基于 z_fused
-- XMD   基于 z_op / z_dose
-- AUG   基于 z_fused 的轻量一致性（dropout 或加噪），受 --use_aug, --lmbd_aug 控制
-"""
+
 
 import os, inspect, random, sys
 from typing import List, Optional, Tuple
@@ -483,8 +478,8 @@ def train_loop(args):
     assert grad_accum >= 1
 
     # ---------- 可选：断点恢复 ----------
-    start_epoch = 1  # 🔵 起始 epoch
-    no_improve = 0  # 🔵 早停计数
+    start_epoch = 1  # 起始 epoch
+    no_improve = 0  # 早停计数
     best_acc = -1.0
 
     if getattr(args, 'resume', '') and os.path.isfile(args.resume):
@@ -500,7 +495,7 @@ def train_loop(args):
                 scheduler.load_state_dict(state['scheduler'])
             best_acc = float(state.get('best_acc', -1.0))
             no_improve = int(state.get('no_improve', 0))
-            start_epoch = int(state.get('epoch', 0)) + 1  # 🔵 新
+            start_epoch = int(state.get('epoch', 0)) + 1  
             print(f"[*] 已从 {args.resume} 恢复：继续 epoch {start_epoch}，best_acc={best_acc:.4f}")
 
         except Exception as e:
@@ -669,3 +664,4 @@ def train_loop(args):
         if no_improve >= patience:
             print(f"[EarlyStop] 连续 {patience} 个 epoch 未提升，提前终止训练。")
             break
+
