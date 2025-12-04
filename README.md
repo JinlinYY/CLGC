@@ -1,7 +1,7 @@
 
 # A Cross‑modal Lag-aware Graph Contrastive Learning Framework for Safety Domain Modeling in Process Industry
 
-![image]((https://github.com/JinlinYY/CLGC/blob/main/abstract.png))
+![image](https://github.com/JinlinYY/CLGC/blob/main/abstract.png)
 
 Official implementation for “A Cross-modal Lag-aware Graph Contrastive Learning Framework for Safety-Domain Modeling in Process Industry”.
 
