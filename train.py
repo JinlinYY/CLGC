@@ -1,11 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-训练入口：支持 NPS / TFF
-- NPS：op + dose 双模态，含跨模态滞后边与同模态相关性边
-- TFF：建议单模态（仅 op 的相关性边），启动方式：
-    --dataset TFF --op_dir Data/TFF_csv --topk_cross 0 --dose_topk 0
-    （这样数据集中会自动不构造 dose 与跨模态边，模型前向也走单模态分支）
-"""
+
 import os, argparse, warnings, torch, datetime, json
 from utils.train_eval import train_loop
 
@@ -143,3 +137,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
