@@ -1,14 +1,5 @@
-# utils/eval_only.py
 # -*- coding: utf-8 -*-
-"""
-仅评估脚本（NPS/TFF 通用，带 force_resplit 开关）
-- 从 checkpoint 恢复模型；
-- 测试集划分：
-    * --force_resplit 1（默认）：忽略 ckpt 中的 test_idx，始终重新划分；
-    * --force_resplit 0：若 ckpt 内含 test_idx（或等价键），优先使用其测试划分，否则回退为重新划分；
-- 计算并保存各类指标（txt）、混淆矩阵（.npy/.png）、t-SNE（.png）、ROC（.png）、PR（.png）；
-- 可导出预测 CSV。
-"""
+
 
 import os
 import inspect
@@ -33,7 +24,7 @@ from sklearn.preprocessing import label_binarize
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 
-# 数据集与模型（按你的工程路径）
+# 数据集与模型
 import dataset.data_sampling_lag_edge_attr as ds
 from models.temporal_hetero_gnn_edge_attr_contrastive import TemporalPhysicalHeteroGNN_V2
 
@@ -275,13 +266,7 @@ def _plot_tsne(z: np.ndarray, y: np.ndarray, id2label: Optional[Dict[int, str]],
         return
     # 自动约束 perplexity
     perplexity = max(5.0, min(perplexity, (n - 1) / 3))
-    # sklearn 1.2+ 中 TSNE 参数可能有变，若报错 n_iter 可尝试改为 n_iter_ 或直接移除（通常 n_iter 仍支持，但部分版本可能严格）
-    # 实际上 sklearn TSNE 一直支持 n_iter，报错可能是因为使用了 cuml.TSNE 或其他库？
-    # 或者 sklearn 版本极低/极高？
-    # 稳妥起见，这里保留 n_iter 但如果报错请检查 sklearn 版本。
-    # 修正：用户报错 TypeError: TSNE.__init__() got an unexpected keyword argument 'n_iter'
-    # 这说明当前环境的 TSNE 不接受 n_iter 参数（可能是 openTSNE 或非常旧/新的 sklearn 变体？）
-    # 既然报错了，我们直接移除 n_iter（使用默认值 1000）
+    
     emb2d = TSNE(n_components=2, perplexity=perplexity, learning_rate=lr,
                  init="random", random_state=seed,
                  metric="euclidean").fit_transform(z)
@@ -758,3 +743,4 @@ def eval_only(args):
         "fnr_macro": fnr_macro, "fnr_weighted": fnr_weighted,
         "cm": cm
     }
+
